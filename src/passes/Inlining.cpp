@@ -31,6 +31,7 @@
 #include <atomic>
 
 #include "ir/branch-utils.h"
+#include "ir/cost.h"
 #include "ir/debug.h"
 #include "ir/drop.h"
 #include "ir/eh-utils.h"
@@ -808,21 +809,11 @@ private:
   // are willing to inline it in this optimization. This should basically take
   // almost no cost at all to compute.
   bool isSimple(Expression* curr) {
-    // For now, support local and global gets, and unary operations.
-    // TODO: Generalize? Use costs.h?
     if (curr->type == Type::unreachable) {
       return false;
     }
-    if (curr->is<GlobalGet>() || curr->is<LocalGet>()) {
-      return true;
-    }
-    if (auto* unary = curr->dynCast<Unary>()) {
-      return isSimple(unary->value);
-    }
-    if (auto* is = curr->dynCast<RefIs>()) {
-      return isSimple(is->value);
-    }
-    return false;
+    // Allow a simple comparison like (i32.lt_s (local.get $0) (local.get $1)).
+    return CostAnalyzer(curr).cost <= 3;
   }
 
   // Returns a list of local.gets, one for each of the parameters to the

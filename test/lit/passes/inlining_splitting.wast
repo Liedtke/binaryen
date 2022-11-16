@@ -9,10 +9,10 @@
 
   ;; CHECK:      (type $anyref_=>_anyref (func (param anyref) (result anyref)))
 
-  ;; CHECK:      (type $anyref_=>_none (func (param anyref)))
-
   ;; CHECK:      (type $struct (struct ))
   (type $struct (struct))
+
+  ;; CHECK:      (type $anyref_=>_none (func (param anyref)))
 
   ;; CHECK:      (type $i64_i32_f64_=>_none (func (param i64 i32 f64)))
 
@@ -21,6 +21,9 @@
 
   ;; CHECK:      (global $glob i32 (i32.const 1))
   (global $glob i32 (i32.const 1))
+
+  ;; CHECK:      (tag $e-i32 (param i32))
+  (tag $e-i32 (param i32))
 
   ;; CHECK:      (start $start-used-globally)
   (start $start-used-globally)
@@ -469,11 +472,10 @@
     (call $condition-ref.is (ref.null any))
   )
 
-  ;; CHECK:      (func $condition-disallow-binary (param $x i32)
+  ;; CHECK:      (func $condition-disallow-expensive (param $x i32)
   ;; CHECK-NEXT:  (if
-  ;; CHECK-NEXT:   (i32.add
-  ;; CHECK-NEXT:    (local.get $x)
-  ;; CHECK-NEXT:    (local.get $x)
+  ;; CHECK-NEXT:   (ref.is_null
+  ;; CHECK-NEXT:    (struct.new_default $struct)
   ;; CHECK-NEXT:   )
   ;; CHECK-NEXT:   (return)
   ;; CHECK-NEXT:  )
@@ -482,13 +484,10 @@
   ;; CHECK-NEXT:   (br $l)
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
-  (func $condition-disallow-binary (param $x i32)
+  (func $condition-disallow-expensive (param $x i32)
     (if
-      ;; Work we do *not* allow (at least for now), a binary.
-      (i32.add
-        (local.get $x)
-        (local.get $x)
-      )
+      ;; Expensive conditions prevent inlining of the if.
+      (ref.is_null (struct.new $struct))
       (return)
     )
     (loop $l
@@ -497,17 +496,17 @@
     )
   )
 
-  ;; CHECK:      (func $call-condition-disallow-binary
-  ;; CHECK-NEXT:  (call $condition-disallow-binary
+  ;; CHECK:      (func $call-condition-disallow-expensive
+  ;; CHECK-NEXT:  (call $condition-disallow-expensive
   ;; CHECK-NEXT:   (i32.const 0)
   ;; CHECK-NEXT:  )
-  ;; CHECK-NEXT:  (call $condition-disallow-binary
+  ;; CHECK-NEXT:  (call $condition-disallow-expensive
   ;; CHECK-NEXT:   (i32.const 1)
   ;; CHECK-NEXT:  )
   ;; CHECK-NEXT: )
-  (func $call-condition-disallow-binary
-    (call $condition-disallow-binary (i32.const 0))
-    (call $condition-disallow-binary (i32.const 1))
+  (func $call-condition-disallow-expensive
+    (call $condition-disallow-expensive (i32.const 0))
+    (call $condition-disallow-expensive (i32.const 1))
   )
 
   ;; CHECK:      (func $condition-disallow-unreachable (param $x i32)
@@ -1333,6 +1332,60 @@
     (drop (call $too-many-ifs (ref.null any)))
     (drop (call $too-many-ifs (ref.null data)))
   )
+
+  (func $throw-if-negative (param $x i32)
+    (if
+      (i32.lt_s
+        (local.get $x)
+        (i32.const 0)
+      )
+      (block
+        (call $import)
+        (throw $e-i32 (i32.const 0))
+      )
+    )
+  )
+
+  ;; CHECK:      (func $call-throw-if-negative
+  ;; CHECK-NEXT:  (local $0 i32)
+  ;; CHECK-NEXT:  (local $1 i32)
+  ;; CHECK-NEXT:  (block
+  ;; CHECK-NEXT:   (block $__inlined_func$byn-split-inlineable-B$throw-if-negative
+  ;; CHECK-NEXT:    (local.set $0
+  ;; CHECK-NEXT:     (i32.const 1)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (if
+  ;; CHECK-NEXT:     (i32.lt_s
+  ;; CHECK-NEXT:      (local.get $0)
+  ;; CHECK-NEXT:      (i32.const 0)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (call $byn-split-outlined-B$throw-if-negative
+  ;; CHECK-NEXT:      (local.get $0)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT:  (block
+  ;; CHECK-NEXT:   (block $__inlined_func$byn-split-inlineable-B$throw-if-negative0
+  ;; CHECK-NEXT:    (local.set $1
+  ;; CHECK-NEXT:     (i32.const -1)
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:    (if
+  ;; CHECK-NEXT:     (i32.lt_s
+  ;; CHECK-NEXT:      (local.get $1)
+  ;; CHECK-NEXT:      (i32.const 0)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:     (call $byn-split-outlined-B$throw-if-negative
+  ;; CHECK-NEXT:      (local.get $1)
+  ;; CHECK-NEXT:     )
+  ;; CHECK-NEXT:    )
+  ;; CHECK-NEXT:   )
+  ;; CHECK-NEXT:  )
+  ;; CHECK-NEXT: )
+  (func $call-throw-if-negative
+    (call $throw-if-negative (i32.const 1))
+    (call $throw-if-negative (i32.const -1))
+  )
 )
 
 ;; CHECK:      (func $byn-split-outlined-A$maybe-work-hard (param $x i32)
@@ -1409,6 +1462,13 @@
 ;; CHECK-NEXT:   (br_if $x
 ;; CHECK-NEXT:    (global.get $glob)
 ;; CHECK-NEXT:   )
+;; CHECK-NEXT:  )
+;; CHECK-NEXT: )
+
+;; CHECK:      (func $byn-split-outlined-B$throw-if-negative (param $x i32)
+;; CHECK-NEXT:  (call $import)
+;; CHECK-NEXT:  (throw $e-i32
+;; CHECK-NEXT:   (i32.const 0)
 ;; CHECK-NEXT:  )
 ;; CHECK-NEXT: )
 (module
