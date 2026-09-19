@@ -86,6 +86,7 @@ int main(int argc, const char* argv[]) {
   bool fuzzMemory = true;
   bool fuzzOOB = true;
   bool fuzzPreserveImportsAndExports = false;
+  bool fuzzReplaceContents = false;
   bool fuzzAgainstJS = false;
   std::string fuzzImport;
   std::string emitSpecWrapper;
@@ -211,6 +212,16 @@ For more on how to optimize effectively, see
          Options::Arguments::Zero,
          [&](Options* o, const std::string& arguments) {
            fuzzPreserveImportsAndExports = true;
+         })
+    .add("--fuzz-replace-contents",
+         "",
+         "in -ttf mode, discard the initial content's internals and regenerate "
+         "them, keeping only imports, exports and the start function (requires "
+         "--fuzz-preserve-imports-exports)",
+         WasmOptOption,
+         Options::Arguments::Zero,
+         [&](Options* o, const std::string& arguments) {
+           fuzzReplaceContents = true;
          })
     .add(
       "--fuzz-against-js",
@@ -352,11 +363,16 @@ For more on how to optimize effectively, see
     }
   }
   if (translateToFuzz) {
+    if (fuzzReplaceContents && !fuzzPreserveImportsAndExports) {
+      Fatal() << "--fuzz-replace-contents requires "
+                 "--fuzz-preserve-imports-exports";
+    }
     TranslateToFuzzReader reader(
       wasm, options.extra["infile"], options.passOptions.worldMode);
     reader.setAllowMemory(fuzzMemory);
     reader.setAllowOOB(fuzzOOB);
     reader.setPreserveImportsAndExports(fuzzPreserveImportsAndExports);
+    reader.setReplaceContents(fuzzReplaceContents);
     reader.setAgainstJS(fuzzAgainstJS);
     if (!fuzzImport.empty()) {
       reader.setImportedModule(fuzzImport);

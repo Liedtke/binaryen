@@ -1,0 +1,11 @@
+(module
+ (memory $0 1 1)
+ (global $private_global i32 (i32.const 42))
+ (export "kept" (func $kept))
+ (func $kept (result i32)
+  (call $private_helper)
+ )
+ (func $private_helper (result i32)
+  (global.get $private_global)
+ )
+)

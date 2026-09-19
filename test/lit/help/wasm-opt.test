@@ -72,6 +72,13 @@
 ;; CHECK-NEXT:   --fuzz-preserve-imports-exports               don't add imports and exports in
 ;; CHECK-NEXT:                                                 -ttf mode, and keep the start
 ;; CHECK-EMPTY:
+;; CHECK-NEXT:   --fuzz-replace-contents                       in -ttf mode, discard the 
+;; CHECK-NEXT:                                                 initial content's internals and 
+;; CHECK-NEXT:                                                 regenerate them, keeping only 
+;; CHECK-NEXT:                                                 imports, exports and the start 
+;; CHECK-NEXT:                                                 function (requires 
+;; CHECK-NEXT:                                                 --fuzz-preserve-imports-exports)
+;; CHECK-EMPTY:
 ;; CHECK-NEXT:   --fuzz-against-js                             modify the wasm in valid ways 
 ;; CHECK-NEXT:                                                 that assume it is used only from
 ;; CHECK-NEXT:                                                 JS

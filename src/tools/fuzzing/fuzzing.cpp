@@ -420,6 +420,21 @@ void TranslateToFuzzReader::build() {
     setupMemory();
   }
   setupHeapTypes();
+  // This must run after setupHeapTypes(), which snapshots the initial content's
+  // heap types into interestingHeapTypes. That snapshot is what lets us keep
+  // generating interesting code after removing the content that used those
+  // types. It must also run before the setup* calls below and before
+  // processFunctions(), which create the new content that replaces the old.
+  if (replaceContents) {
+    replaceInitialContents();
+    // replaceInitialContents() cleared the data segments, which are content
+    // that would otherwise accumulate across chained mutations. Recreate a
+    // fresh set: setupMemory() leaves the existing memory alone, and without
+    // this we would never emit memory.init or data.drop again.
+    if (allowMemory) {
+      setupMemory();
+    }
+  }
   setupTables();
   setupGlobals();
   useImportedGlobals();
@@ -638,6 +653,237 @@ void TranslateToFuzzReader::setupHeapTypes() {
       }
     } else if (type.isArray()) {
       typeArrays[type.getArray().element.type].push_back(type);
+    }
+  }
+}
+
+Expression* TranslateToFuzzReader::makeNeutralInit(Type type) {
+  // A defaultable type always has a trivially valid zero constant.
+  if (type.isDefaultable()) {
+    return builder.makeConstantExpression(Literal::makeZeros(type));
+  }
+  // Otherwise try to build something, but only accept it if it is actually
+  // valid in a global initializer. makeConst() may emit a ref.as_non_null (to
+  // escape an overly-nested struct or array) or a cont.new, neither of which
+  // validates in a constant expression. setupGlobals() handles that by
+  // changing the global's type, but we cannot do that here: the type of an
+  // exported global is part of the public interface we are preserving.
+  auto* init = makeConst(type);
+  if (!FindAll<RefAs>(init).list.empty() ||
+      !FindAll<ContNew>(init).list.empty()) {
+    return nullptr;
+  }
+  return init;
+}
+
+void TranslateToFuzzReader::replaceInitialContents() {
+  assert(preserveImportsAndExports);
+
+  // Compute the set of things we must keep: everything reachable from the
+  // module's public interface. That is, everything exported, the start
+  // function, and all imports (which this mode preserves verbatim).
+  std::unordered_set<Name> keepFuncs, keepGlobals, keepTags, keepTables;
+  for (auto& exp : wasm.exports) {
+    auto* name = exp->getInternalName();
+    if (!name) {
+      // This export does not refer to a module item (e.g. it is a type export).
+      continue;
+    }
+    switch (exp->kind) {
+      case ExternalKind::Function:
+        keepFuncs.insert(*name);
+        break;
+      case ExternalKind::Global:
+        keepGlobals.insert(*name);
+        break;
+      case ExternalKind::Tag:
+        keepTags.insert(*name);
+        break;
+      case ExternalKind::Table:
+        keepTables.insert(*name);
+        break;
+      case ExternalKind::Memory:
+        // Memories are never removed below, so nothing to note.
+        break;
+      case ExternalKind::Invalid:
+        break;
+    }
+  }
+  // The start function is part of the contract with the outside in this mode
+  // (see processFunctions), so it must survive even if it is not exported.
+  if (wasm.start.is()) {
+    keepFuncs.insert(wasm.start);
+  }
+  // Imports are part of the public interface.
+  for (auto& func : wasm.functions) {
+    if (func->imported()) {
+      keepFuncs.insert(func->name);
+    }
+  }
+  for (auto& global : wasm.globals) {
+    if (global->imported()) {
+      keepGlobals.insert(global->name);
+    }
+  }
+  for (auto& tag : wasm.tags) {
+    if (tag->imported()) {
+      keepTags.insert(tag->name);
+    }
+  }
+  for (auto& table : wasm.tables) {
+    if (table->imported()) {
+      keepTables.insert(table->name);
+    }
+  }
+
+  // A global whose type is not defaultable has no trivial initializer, so we
+  // may have to retain the one it already has (see makeNeutralInit). Such an
+  // initializer can refer to other module items - a ref.func, or a global.get
+  // of an earlier global - and those must then survive as well, or we would
+  // leave a dangling reference behind. We cannot yet tell whether we will end
+  // up retaining it (that is only decided below, after the removals), so be
+  // conservative and retain the dependencies either way. This costs at most a
+  // handful of extra functions, and they are emptied and regenerated like any
+  // other survivor, so nothing accumulates. Note that the fuzzer never emits
+  // array.new_data or array.new_elem, so an initializer cannot refer to a
+  // segment.
+  //
+  // Seed the worklist in module order rather than iterating keepGlobals, so
+  // that we do not depend on hash-set iteration order. A global may only refer
+  // to globals defined before it, so appending discoveries keeps the order
+  // valid.
+  std::vector<Name> globalWorklist;
+  for (auto& global : wasm.globals) {
+    if (keepGlobals.count(global->name)) {
+      globalWorklist.push_back(global->name);
+    }
+  }
+  // A table's initializer is a constant expression too, and the same reasoning
+  // applies to it: if we may have to retain it, retain what it refers to.
+  // Seed this before the worklist loop below, so that any globals discovered
+  // here are themselves scanned.
+  for (auto& table : wasm.tables) {
+    if (table->imported() || !keepTables.count(table->name) || !table->init ||
+        table->type.isDefaultable()) {
+      continue;
+    }
+    for (auto* refFunc : FindAll<RefFunc>(table->init).list) {
+      keepFuncs.insert(refFunc->func);
+    }
+    for (auto* get : FindAll<GlobalGet>(table->init).list) {
+      if (keepGlobals.insert(get->name).second) {
+        globalWorklist.push_back(get->name);
+      }
+    }
+  }
+  for (Index i = 0; i < globalWorklist.size(); i++) {
+    auto* global = wasm.getGlobal(globalWorklist[i]);
+    if (global->imported() || global->type.isDefaultable()) {
+      continue;
+    }
+    for (auto* refFunc : FindAll<RefFunc>(global->init).list) {
+      keepFuncs.insert(refFunc->func);
+    }
+    for (auto* get : FindAll<GlobalGet>(global->init).list) {
+      if (keepGlobals.insert(get->name).second) {
+        globalWorklist.push_back(get->name);
+      }
+    }
+  }
+
+  // Empty the things we keep, *before* removing anything. This severs every
+  // reference from the survivors to the items we are about to delete, so the
+  // module never contains a dangling reference.
+  for (auto& func : wasm.functions) {
+    if (func->imported() || !keepFuncs.count(func->name)) {
+      continue;
+    }
+    // Locals accumulate across generations; drop them. Params must stay, as
+    // they are part of the function's exported signature. An unreachable body
+    // is valid for any result type, and is only a placeholder: processFunctions
+    // will generate a real body for everything in emptiedFuncs.
+    func->vars.clear();
+    // Drop everything that describes the body we are discarding, but keep what
+    // describes the parameters: they survive, as they are part of the
+    // function's signature, so their names are still accurate. Without dropping
+    // the local names the regenerated locals would silently inherit them by
+    // index, ending up with names that belonged to locals of a different type.
+    // The remaining maps are keyed on the old body's expressions, so their keys
+    // would dangle.
+    auto numParams = func->getNumParams();
+    std::erase_if(func->localNames,
+                  [&](const auto& kv) { return kv.first >= numParams; });
+    std::erase_if(func->localIndices,
+                  [&](const auto& kv) { return kv.second >= numParams; });
+    func->debugLocations.clear();
+    func->expressionLocations.clear();
+    func->delimiterLocations.clear();
+    func->codeAnnotations.clear();
+    func->prologLocation.reset();
+    func->epilogLocation.reset();
+    func->body = builder.makeUnreachable();
+    emptiedFuncs.insert(func->name);
+  }
+  // Segments are never exported, and they are the main thing that refers to
+  // functions by name, so clear them entirely. setupTables() recreates the
+  // segments the fuzzer expects, and addFunction() repopulates them.
+  wasm.elementSegments.clear();
+  wasm.dataSegments.clear();
+  wasm.updateMaps();
+
+  // Now remove everything that is not part of the public interface.
+  wasm.removeFunctions(
+    [&](Function* func) { return !keepFuncs.count(func->name); });
+  wasm.removeGlobals(
+    [&](Global* global) { return !keepGlobals.count(global->name); });
+  wasm.removeTags([&](Tag* tag) { return !keepTags.count(tag->name); });
+  wasm.removeTables(
+    [&](Table* table) { return !keepTables.count(table->name); });
+  // Memories are deliberately not removed: setupMemory() has already run, and
+  // finalizeMemory() will fix up the limits later.
+
+  // Drop caches that refer to things we just removed. Note that we do *not*
+  // clear the heap type caches (interestingHeapTypes and friends): those hold
+  // types, not module items, so they remain valid, and keeping them is what
+  // lets us generate code as interesting as before.
+  jsCalled.clear();
+  exceptionTags.clear();
+  trivialTag = Name();
+  globalsByType.clear();
+  mutableGlobalsByType.clear();
+  immutableGlobalsByType.clear();
+  importedImmutableGlobalsByType.clear();
+
+  // Finally, replace the initializers of the globals that survived. This has to
+  // happen after the removals: makeNeutralInit() may emit a ref.func, and
+  // makeRefFuncConst() picks its target out of wasm.functions, so running it
+  // earlier could point a global at a function that we then delete.
+  //
+  // Iterate by index rather than with a range-for: makeNeutralInit() calls
+  // makeConst(), which has a path to wasm.addGlobal() that would invalidate
+  // iterators into wasm.globals. That path cannot be taken here - it is gated
+  // on !preserveImportsAndExports, which is always true in this mode - but the
+  // guard is several calls away in unrelated code, so do not depend on it.
+  for (Index i = 0; i < wasm.globals.size(); i++) {
+    auto& global = wasm.globals[i];
+    if (global->imported()) {
+      continue;
+    }
+    if (auto* init = makeNeutralInit(global->type)) {
+      global->init = init;
+    }
+    // Otherwise retain the existing initializer, which is still valid: we made
+    // sure above that everything it refers to survived.
+  }
+  // Likewise for the tables that survived: their initializer is content, not
+  // interface (the table's type and limits are what the outside sees), so it is
+  // replaced rather than carried forward.
+  for (auto& table : wasm.tables) {
+    if (table->imported() || !table->init) {
+      continue;
+    }
+    if (auto* init = makeNeutralInit(table->type)) {
+      table->init = init;
     }
   }
 }
@@ -1623,6 +1869,30 @@ void TranslateToFuzzReader::processFunctions() {
   }
 
   auto numInitialExports = wasm.exports.size();
+
+  // Functions we emptied in replaceInitialContents() have only a placeholder
+  // unreachable body. Generate a real body for them now: modFunction() below
+  // only makes small changes to existing code, which would leave these nearly
+  // empty, and they are typically the module's exports, that is, the main way
+  // the outside can run any of our code.
+  if (!emptiedFuncs.empty()) {
+    // Pick a logging frequency before generating those bodies. LOGGING_PERCENT
+    // is otherwise only set in addFunction(), which runs later, so without this
+    // it would still be 0 here and these functions would never log - and, being
+    // the module's exports, they are exactly the ones whose behavior a
+    // differential fuzzer compares.
+    LOGGING_PERCENT = upToSquared(100);
+  }
+  for (auto* func : moddable) {
+    if (emptiedFuncs.count(func->name)) {
+      FunctionCreationContext context(*this, func);
+      if (oneIn(2)) {
+        func->body = makeBlock(func->getResults());
+      } else {
+        func->body = make(func->getResults());
+      }
+    }
+  }
 
   // Add invocations, which can help execute the code here even if the function
   // was not exported (or was exported but with a signature that traps
@@ -3398,6 +3668,11 @@ Expression* TranslateToFuzzReader::makeCall(Type type) {
 }
 
 Expression* TranslateToFuzzReader::makeCallIndirect(Type type) {
+  // We need an element segment to pick a target from. Normally setupTables()
+  // ensures one exists, but be careful in case it does not.
+  if (wasm.elementSegments.empty()) {
+    return makeTrivial(type);
+  }
   auto& randomElem = wasm.elementSegments[upTo(wasm.elementSegments.size())];
   auto& data = randomElem->data;
   if (data.empty()) {
@@ -6390,7 +6665,9 @@ Expression* TranslateToFuzzReader::makeThrowRef(Type type) {
 }
 
 Expression* TranslateToFuzzReader::makeMemoryInit() {
-  if (!allowMemory) {
+  // We need a data segment to initialize from. Normally setupMemory() ensures
+  // one exists, but it may not when we replaced the initial contents.
+  if (!allowMemory || wasm.dataSegments.empty()) {
     return makeTrivial(Type::none);
   }
   Index segIdx = upTo(wasm.dataSegments.size());
@@ -6406,7 +6683,7 @@ Expression* TranslateToFuzzReader::makeMemoryInit() {
 }
 
 Expression* TranslateToFuzzReader::makeDataDrop() {
-  if (!allowMemory) {
+  if (!allowMemory || wasm.dataSegments.empty()) {
     return makeTrivial(Type::none);
   }
   Index segIdx = upTo(wasm.dataSegments.size());

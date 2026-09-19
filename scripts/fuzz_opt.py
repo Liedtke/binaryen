@@ -2179,6 +2179,73 @@ class PreserveImportsExportsRandom(TestCaseHandler):
         compare(get_relevant_lines(original), get_relevant_lines(processed), 'Preserve')
 
 
+# Test --fuzz-replace-contents on random inputs. Like
+# PreserveImportsExportsRandom, this must never modify imports or exports. The
+# difference is that this mode also discards the initial content's internals and
+# regenerates them, so it exercises a lot more new code while still being held
+# to the same interface guarantee.
+class ReplaceContentsRandom(TestCaseHandler):
+    frequency = 0.1
+
+    @override
+    def handle(self, wasm):
+        # We will later verify that no imports or exports changed, by comparing
+        # to the unprocessed original text.
+        original = run([in_bin('wasm-opt'), wasm] + FEATURE_OPTS + ['--print'])
+
+        # See the note in PreserveImportsExportsRandom: a (ref exn) in a struct
+        # field cannot be created in a global context.
+        structs = [line for line in original.split('\n') if '(struct ' in line]
+        if '(ref exn)' in '\n'.join(structs):
+            note_ignored_vm_run('has non-nullable exn in struct')
+            return
+
+        # Generate some random input data.
+        data = abspath('replace_contents_input.dat')
+        make_random_input(random_size(), data)
+
+        # Process the existing wasm file.
+        processed = run([in_bin('wasm-opt'), data] + FEATURE_OPTS + [
+            '-ttf',
+            '--fuzz-preserve-imports-exports',
+            '--fuzz-replace-contents',
+            '--initial-fuzz=' + wasm,
+            '--print',
+        ])
+
+        def get_relevant_lines(wat):
+            # Imports and exports are relevant.
+            lines = [line for line in wat.splitlines() if '(export ' in line or '(import ' in line]
+
+            # Ignore type names, which may vary (e.g. one file may have $5 and
+            # another may call the same type $17).
+            lines = [re.sub(r'[(]type [$][0-9a-zA-Z_$]+[)]', '', line) for line in lines]
+
+            # Unlike --fuzz-preserve-imports-exports on its own, this mode
+            # deletes the private items, so the survivors get renumbered and
+            # their internal names shift (an export of $global$5 may become an
+            # export of $global$3). That is not an interface change: the name,
+            # kind and signature of each export and import are what matter, and
+            # those are all still compared. Normalize the internal names away.
+            #
+            # Only the internal ones, though. The quoted names are the public
+            # ones, and a change there is exactly what this handler exists to
+            # catch - and the fuzzer emits export names like "global$_12", so a
+            # blanket substitution would eat those too, collapsing every such
+            # export to the same string.
+
+            def normalize(line):
+                parts = re.split(r'("(?:[^"\\]|\\.)*")', line)
+                return ''.join(
+                    part if part.startswith('"')
+                    else re.sub(r'[$][0-9a-zA-Z_$.]+', '$X', part)
+                    for part in parts)
+            return '\n'.join(normalize(line) for line in lines)
+
+        compare(get_relevant_lines(original), get_relevant_lines(processed),
+                'ReplaceContents')
+
+
 # Test --fuzz-preserve-imports-exports on a realistic js+wasm input. Unlike
 # PreserveImportsExportsRandom which starts with a random file and modifies it,
 # this starts with a fixed js+wasm testcase, known to work and to have
@@ -2585,6 +2652,7 @@ testcase_handlers = [
     Two(),
     PreserveImportsExportsRandom(),
     PreserveImportsExportsJS(),
+    ReplaceContentsRandom(),
     BranchHintPreservation(),
 ]
 

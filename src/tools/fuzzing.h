@@ -132,6 +132,9 @@ public:
   void setPreserveImportsAndExports(bool preserveImportsAndExports_) {
     preserveImportsAndExports = preserveImportsAndExports_;
   }
+  void setReplaceContents(bool replaceContents_) {
+    replaceContents = replaceContents_;
+  }
   void setAgainstJS(bool againstJS_) { againstJS = againstJS_; }
   void setImportedModule(std::string importedModuleName);
 
@@ -159,6 +162,15 @@ private:
   // exports, which is useful if the tool using us only wants us to mutate an
   // existing testcase (using initial-content).
   bool preserveImportsAndExports = false;
+
+  // Whether to discard the internals of the initial content and regenerate
+  // them, keeping only the imports and exports (and the start function). This
+  // makes mutation size-neutral: rather than adding new content on top of the
+  // existing module, we replace the module's contents entirely, behind a fixed
+  // public interface. Without this, repeatedly mutating a module (feeding each
+  // output back in as initial content) grows it without bound. Only valid
+  // together with preserveImportsAndExports.
+  bool replaceContents = false;
 
   // Whether the wasm will be used from JS and in no other way. This lets us
   // modify the wasm in ways that keep it valid from JS's point of view, but
@@ -239,6 +251,11 @@ private:
 
   // Whether we were given initial functions.
   bool haveInitialFunctions;
+
+  // Functions whose bodies we emptied in replaceInitialContents(). These need a
+  // fully generated new body, rather than the small mutations modFunction()
+  // would apply to the placeholder we left behind.
+  std::unordered_set<Name> emptiedFuncs;
 
   // RAII helper for managing the state used to create a single function.
   struct FunctionCreationContext {
@@ -340,6 +357,13 @@ private:
   // Setup methods
   void setupMemory();
   void setupHeapTypes();
+  // Discard the initial content's internals, keeping only imports, exports and
+  // the start function, so that the generation below refills them. See the
+  // replaceContents flag.
+  void replaceInitialContents();
+  // Make a valid, minimal constant expression for a global initializer of the
+  // given type, or null if we cannot safely make one.
+  Expression* makeNeutralInit(Type type);
   void setupTables();
   bool isImportableGlobalType(Type type);
   bool isImportableGlobal(Global* global);

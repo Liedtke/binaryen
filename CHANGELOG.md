@@ -23,6 +23,11 @@ Current Trunk
 - Note that fast-math mode can ignore the difference between negative zero and
   zero (like clang and gcc). (#9056)
 - [JS API] **(breaking)** Organize types into enums (#9098)
+- New fuzzer mode: `--fuzz-replace-contents`, which makes `-ttf` mutation
+  size-neutral by discarding the initial content's internals and regenerating
+  them behind its preserved imports, exports and start function. Without this,
+  repeatedly mutating a module (feeding each output back in as initial content)
+  grows it without bound. Requires `--fuzz-preserve-imports-exports`. (#XXXX)
 
 v132
 ----
